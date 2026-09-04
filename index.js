@@ -37,37 +37,6 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ── Test endpoint (no auth) ────────────────────────────────────────────────
-app.post('/api/test', async (req, res) => {
-  try {
-    console.log('[test] Calling OpenRouter with simple prompt...');
-    const openrouterRes = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENROUTER_CHAT_MODEL,
-        messages: [{ role: 'user', content: 'Say hello' }],
-      }),
-    });
-
-    if (!openrouterRes.ok) {
-      const error = await openrouterRes.text();
-      console.error('[test] OpenRouter error:', error);
-      return res.status(500).json({ error: `OpenRouter error: ${openrouterRes.status}` });
-    }
-
-    const data = await openrouterRes.json();
-    const reply = data.choices?.[0]?.message?.content || 'No response';
-    res.json({ reply });
-  } catch (err) {
-    console.error('[test] Error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ── Auth guard ─────────────────────────────────────────────────────────────
 // Every request must carry a valid Supabase session token.
 // If the token is missing or invalid we reject before touching Gemini at all.
@@ -79,21 +48,16 @@ async function requireAuth(req, res, next) {
   }
   const token = auth.slice(7);
   try {
-    console.log('[auth] Validating token with Supabase...');
     const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
       headers: {
         Authorization: `Bearer ${token}`,
         apikey: SUPABASE_ANON_KEY,
       },
     });
-    console.log('[auth] Supabase response status:', r.status);
     if (!r.ok) {
-      const errText = await r.text();
-      console.error('[auth] Supabase error:', errText);
       return res.status(401).json({ error: 'Invalid or expired session. Please sign in again.' });
     }
     req.user = await r.json();
-    console.log('[auth] ✓ User authenticated:', req.user.email);
     next();
   } catch (err) {
     console.error('[auth] Check failed:', err.message);
@@ -422,6 +386,50 @@ Return only valid JSON, no markdown, no explanation.`;
   } catch (err) {
     console.error('[scan-seed-pack] Error:', err.message || err);
     res.status(500).json({ error: err.message || 'Scan failed.' });
+  }
+});
+
+// ── Barcode Lookup ────────────────────────────────────────────────────────
+app.post('/api/lookup-barcode', requireAuth, async (req, res) => {
+  const { barcode } = req.body;
+  if (!barcode) return res.status(400).json({ error: 'No barcode provided.' });
+  // Barcode goes straight into a URL path — keep it to digits so it can't traverse.
+  if (!/^\d{6,14}$/.test(String(barcode))) {
+    return res.status(400).json({ error: 'Invalid barcode.' });
+  }
+
+  try {
+    console.log('[lookup-barcode] Looking up barcode:', barcode);
+
+    // Query Open Food Facts API
+    const url = `https://world.openfoodfacts.org/api/v0/product/${barcode}.json`;
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      console.log('[lookup-barcode] Barcode not found in database');
+      return res.json({ found: false, message: 'Barcode not found. Please enter details manually.' });
+    }
+
+    const data = await response.json();
+
+    if (!data.product) {
+      console.log('[lookup-barcode] No product data returned');
+      return res.json({ found: false, message: 'No product information found.' });
+    }
+
+    const product = data.product;
+    const extracted = {
+      plant_name: product.product_name || product.brands || 'Unknown',
+      image_url: product.image_front_url || product.image_url || null,
+      manufacturer: product.brands || '',
+      description: product.generic_name || '',
+    };
+
+    console.log('[lookup-barcode] ✓ Found product:', extracted.plant_name);
+    res.json({ found: true, extracted });
+  } catch (err) {
+    console.error('[lookup-barcode] Error:', err.message);
+    res.status(500).json({ error: 'Lookup failed. Please try again.' });
   }
 });
 
