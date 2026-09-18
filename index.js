@@ -445,8 +445,8 @@ process.on('uncaughtException', (error) => {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 const PORT = 3001;
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Allotment API listening on 0.0.0.0:${PORT} (all interfaces)`);
+const server = app.listen(PORT, '127.0.0.1', () => {
+  console.log(`Allotment API listening on 127.0.0.1:${PORT} (nginx only)`);
 });
 
 // Keep-alive to prevent crashes
