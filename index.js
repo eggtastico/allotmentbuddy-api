@@ -19,7 +19,11 @@ app.use((req, res, next) => {
 const OPENROUTER_BASE_URL = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_CHAT_MODEL = process.env.OPENROUTER_CHAT_MODEL || 'meta-llama/llama-3.3-70b-instruct:free';
-const OPENROUTER_VISION_MODEL = process.env.OPENROUTER_VISION_MODEL || 'google/gemini-2.5-pro-exp:free';
+// Comma-separated: OpenRouter tries each in turn, so a free model that is
+// rate-limited or withdrawn falls through to the next instead of failing the scan.
+const OPENROUTER_VISION_MODELS = (process.env.OPENROUTER_VISION_MODEL
+  || 'dots-studio/dots-3-note-preview:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,google/gemma-4-31b-it:free')
+  .split(',').map((m) => m.trim()).filter(Boolean);
 
 if (!OPENROUTER_API_KEY) {
   console.error('ERROR: OPENROUTER_API_KEY not set in .env');
@@ -27,7 +31,7 @@ if (!OPENROUTER_API_KEY) {
 }
 
 console.log(`✓ Using OpenRouter with chat model: ${OPENROUTER_CHAT_MODEL}`);
-console.log(`✓ Using OpenRouter with vision model: ${OPENROUTER_VISION_MODEL}`);
+console.log(`✓ Using OpenRouter with vision models: ${OPENROUTER_VISION_MODELS.join(' → ')}`);
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -307,14 +311,23 @@ app.post('/api/scan-seed-pack', requireAuth, async (req, res) => {
   const { imageBase64 } = req.body;
   if (!imageBase64) return res.status(400).json({ error: 'No image provided.' });
 
-  // Parse data URL: data:<mediaType>;base64,<data>
+  // Accept a data URL (data:<mediaType>;base64,<data>) or bare base64 — the
+  // Allotment Buddy client strips the prefix and sends bare base64.
   const match = imageBase64.match(/^data:([^;]+);base64,(.+)$/);
-  if (!match) return res.status(400).json({ error: 'Invalid image format. Expected a base64 data URL.' });
-  const [, rawType, base64Data] = match;
+  const base64Data = match ? match[2] : imageBase64;
+  if (!/^[A-Za-z0-9+/]+=*$/.test(base64Data)) {
+    return res.status(400).json({ error: 'Invalid image format. Expected base64 image data.' });
+  }
 
-  // Gemini accepts: image/jpeg, image/png, image/gif, image/webp
+  // Bare base64 carries no type, so read it off the file signature.
+  const sniffed =
+    base64Data.startsWith('/9j/') ? 'image/jpeg'
+    : base64Data.startsWith('iVBOR') ? 'image/png'
+    : base64Data.startsWith('R0lGOD') ? 'image/gif'
+    : base64Data.startsWith('UklGR') ? 'image/webp'
+    : null;
   const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-  const mediaType = allowed.includes(rawType) ? rawType : 'image/jpeg';
+  const mediaType = allowed.includes(match?.[1]) ? match[1] : sniffed || 'image/jpeg';
 
   try {
     console.log('[scan-seed-pack] Processing image with OpenRouter...');
@@ -342,7 +355,7 @@ Return only valid JSON, no markdown, no explanation.`;
         'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
       },
       body: JSON.stringify({
-        model: OPENROUTER_VISION_MODEL,
+        models: OPENROUTER_VISION_MODELS,
         messages: [
           {
             role: 'user',
@@ -352,17 +365,15 @@ Return only valid JSON, no markdown, no explanation.`;
                 text: prompt,
               },
               {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: mediaType,
-                  data: base64Data,
-                },
+                type: 'image_url',
+                image_url: { url: `data:${mediaType};base64,${base64Data}` },
               },
             ],
           },
         ],
-        max_tokens: 500,
+        // The free vision models reason before answering; at 500 they spent
+        // the whole budget thinking and returned no JSON at all.
+        max_tokens: 4000,
       }),
     });
 
