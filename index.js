@@ -18,19 +18,21 @@ app.use((req, res, next) => {
 // OpenRouter API configuration
 const OPENROUTER_BASE_URL = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const OPENROUTER_CHAT_MODEL = process.env.OPENROUTER_CHAT_MODEL || 'meta-llama/llama-3.3-70b-instruct:free';
-// Comma-separated: OpenRouter tries each in turn, so a free model that is
-// rate-limited or withdrawn falls through to the next instead of failing the scan.
-const OPENROUTER_VISION_MODELS = (process.env.OPENROUTER_VISION_MODEL
-  || 'dots-studio/dots-3-note-preview:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,google/gemma-4-31b-it:free')
-  .split(',').map((m) => m.trim()).filter(Boolean);
+// Model settings are comma-separated lists, sent as OpenRouter's `models`: it
+// tries each in turn, so a free model that is rate-limited or withdrawn falls
+// through to the next instead of failing the request.
+const modelList = (value, fallback) => (value || fallback).split(',').map((m) => m.trim()).filter(Boolean);
+const OPENROUTER_CHAT_MODELS = modelList(process.env.OPENROUTER_CHAT_MODEL,
+  'nvidia/nemotron-3-super-120b-a12b:free,apodex/apodex-1.1-mini:free,google/gemma-4-31b-it:free');
+const OPENROUTER_VISION_MODELS = modelList(process.env.OPENROUTER_VISION_MODEL,
+  'dots-studio/dots-3-note-preview:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,google/gemma-4-31b-it:free');
 
 if (!OPENROUTER_API_KEY) {
   console.error('ERROR: OPENROUTER_API_KEY not set in .env');
   process.exit(1);
 }
 
-console.log(`✓ Using OpenRouter with chat model: ${OPENROUTER_CHAT_MODEL}`);
+console.log(`✓ Using OpenRouter with chat models: ${OPENROUTER_CHAT_MODELS.join(' → ')}`);
 console.log(`✓ Using OpenRouter with vision models: ${OPENROUTER_VISION_MODELS.join(' → ')}`);
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -67,6 +69,16 @@ async function requireAuth(req, res, next) {
     console.error('[auth] Check failed:', err.message);
     res.status(500).json({ error: 'Auth check failed.' });
   }
+}
+
+// ── Upstream failure ───────────────────────────────────────────────────────
+// OpenRouter answers 429 when every listed free model is rate-limited, or the
+// key has used up its daily free-model allowance. Say that, not "check the key".
+function aiUnavailable(res, upstreamStatus) {
+  if (upstreamStatus === 429) {
+    return res.status(429).json({ error: 'The free AI models are busy or today’s limit has been reached. Try again later.' });
+  }
+  return res.status(502).json({ error: 'The AI service is unavailable right now. Try again later.' });
 }
 
 // ── Garden AI chat ─────────────────────────────────────────────────────────
@@ -137,17 +149,19 @@ Guidelines:
         'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
       },
       body: JSON.stringify({
-        model: OPENROUTER_CHAT_MODEL,
+        models: OPENROUTER_CHAT_MODELS,
         messages: conversationMessages,
         temperature: 0.7,
-        max_tokens: 1000,
+        // The free models reason before answering, and that counts against the
+        // cap: a two-paragraph reply took ~1,050 tokens in all, so 1000 cut it off.
+        max_tokens: 4000,
       }),
     });
 
     if (!openrouterRes.ok) {
       const error = await openrouterRes.text();
       console.error('[garden-ai] OpenRouter error:', error);
-      return res.status(500).json({ error: 'AI service unavailable. Check API key.' });
+      return aiUnavailable(res, openrouterRes.status);
     }
 
     const data = await openrouterRes.json();
@@ -190,7 +204,7 @@ Keep it practical, specific to UK climate, and encouraging. Use markdown formatt
         'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
       },
       body: JSON.stringify({
-        model: OPENROUTER_CHAT_MODEL,
+        models: OPENROUTER_CHAT_MODELS,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: `I want to grow these plants on my UK allotment:\n\n${plants}\n\nPlease create a comprehensive growing guide with timings, companions, and layout suggestions.` },
@@ -201,7 +215,7 @@ Keep it practical, specific to UK climate, and encouraging. Use markdown formatt
     if (!openrouterRes.ok) {
       const error = await openrouterRes.text();
       console.error('[grow-guide] OpenRouter error:', error);
-      return res.status(500).json({ error: 'AI service unavailable. Check API key.' });
+      return aiUnavailable(res, openrouterRes.status);
     }
 
     const data = await openrouterRes.json();
@@ -274,7 +288,7 @@ Analyze this data and provide watering recommendations for EACH plant listed abo
         'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
       },
       body: JSON.stringify({
-        model: OPENROUTER_CHAT_MODEL,
+        models: OPENROUTER_CHAT_MODELS,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
@@ -285,15 +299,17 @@ Analyze this data and provide watering recommendations for EACH plant listed abo
     if (!openrouterRes.ok) {
       const error = await openrouterRes.text();
       console.error('[watering-guide] OpenRouter error:', error);
-      return res.status(500).json({ error: 'AI service unavailable. Check API key.' });
+      return aiUnavailable(res, openrouterRes.status);
     }
 
     const data = await openrouterRes.json();
     const content = data.choices?.[0]?.message?.content || '{}';
 
+    // Models often wrap the JSON in a ```json fence or a line of preamble.
     let parsed;
     try {
-      parsed = JSON.parse(content);
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(jsonMatch ? jsonMatch[0] : content);
     } catch {
       parsed = { summary: content, overallStatus: 'water', plants: [], tips: [], forecast: '' };
     }
@@ -380,7 +396,7 @@ Return only valid JSON, no markdown, no explanation.`;
     if (!openrouterRes.ok) {
       const err = await openrouterRes.text();
       console.error('[scan-seed-pack] OpenRouter error:', err);
-      return res.status(500).json({ error: 'Scan service unavailable.' });
+      return aiUnavailable(res, openrouterRes.status);
     }
 
     const data = await openrouterRes.json();
