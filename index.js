@@ -1,5 +1,7 @@
 require('dotenv').config();
+const path = require('node:path');
 const express = require('express');
+const { guideKey, createGuideCache, createUserCap } = require('./ai-budget');
 
 const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -81,8 +83,37 @@ function aiUnavailable(res, upstreamStatus) {
   return res.status(502).json({ error: 'The AI service is unavailable right now. Try again later.' });
 }
 
+// ── AI budget ───────────────────────────────────────────────────────────────
+// The free tier allows 50 free-model requests a day across every user and feature (see
+// ai-budget.js): grow guides are cached, and each user is capped so no one uses the lot.
+const guideCache = createGuideCache(path.join(__dirname, 'data', 'grow-guides.json'), 30 * 24 * 3600_000);
+const userCap = createUserCap(Number(process.env.AI_DAILY_PER_USER) || 20);
+
+function spendAi(req, res, next) {
+  if (userCap.take(req.user.id)) return next();
+  console.warn(`[ai-budget] ${req.user.id} reached ${userCap.limit} requests today`);
+  res.status(429).json({ error: `You’ve used today’s ${userCap.limit} AI requests. They reset at midnight UTC.` });
+}
+
+// What's left today, for the app to show before someone asks. OpenRouter's count is cached a
+// minute; checking it isn't charged against the free allowance.
+let keyStatus = { at: 0, value: null };
+app.get('/api/ai-quota', requireAuth, async (req, res) => {
+  if (Date.now() - keyStatus.at > 60_000) {
+    try {
+      const r = await fetch(`${OPENROUTER_BASE_URL}/key`, { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } });
+      const free = r.ok ? (await r.json()).data?.free_model_daily_requests : null;
+      keyStatus = { at: Date.now(), value: free ?? null };
+    } catch { keyStatus = { at: Date.now(), value: null }; }
+  }
+  res.json({
+    shared: keyStatus.value, // { used, limit, remaining } across everyone, or null if unknown
+    you: { used: userCap.used(req.user.id), limit: userCap.limit },
+  });
+});
+
 // ── Garden AI chat ─────────────────────────────────────────────────────────
-app.post('/api/garden-ai', requireAuth, async (req, res) => {
+app.post('/api/garden-ai', requireAuth, spendAi, async (req, res) => {
   const { messages, context } = req.body;
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'No messages provided.' });
@@ -175,9 +206,15 @@ Guidelines:
 });
 
 // ── Grow guide ─────────────────────────────────────────────────────────────
-app.post('/api/grow-guide', requireAuth, async (req, res) => {
+app.post('/api/grow-guide', requireAuth, (req, res, next) => {
   const { plants } = req.body;
   if (!plants) return res.status(400).json({ error: 'No plants provided.' });
+  // The same plants get the same guide: answer from the cache without spending a request.
+  const cached = guideCache.get(guideKey(plants));
+  if (cached) return res.json({ reply: cached, cached: true });
+  next();
+}, spendAi, async (req, res) => {
+  const { plants } = req.body;
 
   const systemPrompt = `You are an expert UK allotment gardening advisor. The user has selected plants they want to grow. Create a comprehensive, personalised growing guide.
 
@@ -219,7 +256,9 @@ Keep it practical, specific to UK climate, and encouraging. Use markdown formatt
     }
 
     const data = await openrouterRes.json();
-    const reply = data.choices?.[0]?.message?.content || 'Sorry, I could not generate a guide.';
+    const content = data.choices?.[0]?.message?.content;
+    const reply = content || 'Sorry, I could not generate a guide.';
+    if (content) guideCache.set(guideKey(plants), content);
     console.log('[grow-guide] ✓ Response generated');
     res.json({ reply });
   } catch (err) {
@@ -229,7 +268,7 @@ Keep it practical, specific to UK climate, and encouraging. Use markdown formatt
 });
 
 // ── Watering guide ─────────────────────────────────────────────────────────
-app.post('/api/watering-guide', requireAuth, async (req, res) => {
+app.post('/api/watering-guide', requireAuth, spendAi, async (req, res) => {
   const { weatherData, plants, forecast } = req.body;
   if (!weatherData || !plants) return res.status(400).json({ error: 'Missing required data.' });
 
@@ -332,7 +371,7 @@ Analyze this data and provide watering recommendations for EACH plant listed abo
 });
 
 // ── Seed pack scanner ──────────────────────────────────────────────────────
-app.post('/api/scan-seed-pack', requireAuth, async (req, res) => {
+app.post('/api/scan-seed-pack', requireAuth, spendAi, async (req, res) => {
   const { imageBase64 } = req.body;
   if (!imageBase64) return res.status(400).json({ error: 'No image provided.' });
 
