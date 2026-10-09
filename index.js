@@ -230,13 +230,25 @@ Keep it practical, specific to UK climate, and encouraging. Use markdown formatt
 
 // ── Watering guide ─────────────────────────────────────────────────────────
 app.post('/api/watering-guide', requireAuth, async (req, res) => {
-  const { weatherData, plants, structures } = req.body;
+  const { weatherData, plants, forecast } = req.body;
   if (!weatherData || !plants) return res.status(400).json({ error: 'Missing required data.' });
 
-  // Format plants array into readable text
+  // Format plants array into readable text (capped: the prompt has to stay small)
   const plantsText = Array.isArray(plants)
-    ? plants.map((p) => `${p.emoji} ${p.name} (${p.category}, ${p.location}${p.selfWatering ? ', self-watering' : ''})`).join('\n')
+    ? plants.slice(0, 60).map((p) => `${p.emoji} ${p.name}${p.count > 1 ? ` ×${p.count}` : ''} (${p.category}, ${p.location}${p.selfWatering ? ', self-watering' : ''})`).join('\n')
     : plants;
+
+  // v2 sends no humidity, and v1 no forecast, so each line only when present.
+  const has = (v) => v !== undefined && v !== null && v !== '';
+  const weatherText = [
+    `- Temperature: ${weatherData.temperature}°C`,
+    has(weatherData.humidity) && `- Humidity: ${weatherData.humidity}%`,
+    has(weatherData.windSpeed) && `- Wind: ${weatherData.windSpeed} km/h`,
+    `- Conditions: ${weatherData.conditions}`,
+  ].filter(Boolean).join('\n');
+  const forecastText = Array.isArray(forecast) && forecast.length
+    ? `\n\nFORECAST:\n${forecast.slice(0, 7).map((d) => `- ${d.date}: ${d.condition}, ${d.min}–${d.max}°C, ${d.precip}% chance of rain`).join('\n')}`
+    : '';
 
   const systemPrompt = `You are Allotment Buddy's AI watering advisor. Analyze weather data and garden plants to give specific, actionable watering recommendations.
 
@@ -269,10 +281,7 @@ Guidelines:
   const userPrompt = `Current weather & garden data:
 
 WEATHER:
-- Temperature: ${weatherData.temperature}°C
-- Humidity: ${weatherData.humidity}%
-- Wind: ${weatherData.windSpeed} km/h
-- Conditions: ${weatherData.conditions}
+${weatherText}${forecastText}
 
 PLANTS IN GARDEN:
 ${plantsText}
